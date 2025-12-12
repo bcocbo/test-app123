@@ -1,0 +1,27 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: tes-app-123
+  description: Aplicación desplegada con ArgoCD y GitOps
+  annotations:
+    github.com/project-slug: bcocbo/test-app123
+    backstage.io/kubernetes-id: tes-app-123
+    argocd/app-name: tes-app-123
+    argocd/app-namespace: argocd
+  tags:
+    - argocd
+    - kubernetes
+    - gitops
+    - dev
+  links:
+    - url: https://argocd.example.com/applications/tes-app-123
+      title: ArgoCD Application
+      icon: dashboard
+    - url: https://github.com/bcocbo/gitops-apps/tree/main/values/dev/tes-app-123
+      title: GitOps Config
+      icon: code
+spec:
+  type: service
+  lifecycle: dev
+  owner: user:guest
+  system: platform

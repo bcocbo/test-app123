@@ -1,0 +1,173 @@
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.github/workflows/ci.yaml'  # Ignorar cambios al workflow mismo
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: tes-app-123
+  GITOPS_REPO: bcocbo/gitops-apps
+  APP_NAME: tes-app-123
+  ENVIRONMENT: dev
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 \
+            --tags Key=ManagedBy,Value=Backstage Key=Application,Value=${{ env.APP_NAME }} Key=Environment,Value=${{ env.ENVIRONMENT }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}-${{ github.run_number }}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Update GitOps repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # Configurar git
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # Clonar repositorio GitOps
+          git clone https://${{ secrets.GITOPS_TOKEN }}@github.com/${{ env.GITOPS_REPO }}.git gitops-temp
+          cd gitops-temp
+          
+          # Crear branch para el cambio
+          BRANCH_NAME="update-${{ env.APP_NAME }}-${{ steps.image-tag.outputs.short_sha }}"
+          git checkout -b $BRANCH_NAME
+          
+          # Actualizar values.yaml
+          VALUES_FILE="values/${{ env.ENVIRONMENT }}/${{ env.APP_NAME }}/values.yaml"
+          
+          # Instalar yq si no está disponible
+          if ! command -v yq &> /dev/null; then
+            wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+            chmod +x /usr/local/bin/yq
+          fi
+          
+          # Crear directorio si no existe
+          mkdir -p "$(dirname "$VALUES_FILE")"
+          
+          if [ -f "$VALUES_FILE" ]; then
+            echo "📝 Actualizando values.yaml existente..."
+            # Actualizar microservice.image con la imagen completa (repo:tag)
+            yq eval ".microservice.image = \"${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}\"" -i "$VALUES_FILE"
+          else
+            echo "⚠️  Values file no encontrado. Debería haber sido creado por Backstage."
+            echo "Creando values.yaml básico..."
+            cat > "$VALUES_FILE" << EOF
+          # Values for ${{ env.APP_NAME }}
+          microservice:
+            name: "${{ env.APP_NAME }}"
+            namespace: "${{ env.ENVIRONMENT }}"
+            image: "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+            port: 8000
+            replicas: 2
+          EOF
+          fi
+          
+          # Commit y push
+          git add "$VALUES_FILE"
+            git commit -m "chore: Update ${{ env.APP_NAME }} image to ${{ env.IMAGE_TAG }}
+
+            - Image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            - Commit: ${{ github.sha }}
+            - Branch: ${{ github.ref_name }}
+            - Triggered by: ${{ github.actor }}"
+            
+            git push origin $BRANCH_NAME
+            
+            # Crear Pull Request usando GitHub CLI
+            gh pr create \
+              --title "Update ${{ env.APP_NAME }} image to ${{ env.IMAGE_TAG }}" \
+              --body "## Image Update
+
+            **Application:** ${{ env.APP_NAME }}
+            **Environment:** ${{ env.ENVIRONMENT }}
+            **New Image:** \`${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}\`
+
+            ### Changes
+            - Commit: ${{ github.sha }}
+            - Branch: ${{ github.ref_name }}
+            - Author: ${{ github.actor }}
+            - Message: ${{ github.event.head_commit.message }}
+
+            ### Deployment
+            Once this PR is merged, ArgoCD will automatically deploy the new image to the \`${{ env.ENVIRONMENT }}\` environment.
+
+            ---
+            🤖 Automated update from [${{ github.repository }}](${{ github.event.repository.html_url }}/commit/${{ github.sha }})" \
+              --base main \
+              --head $BRANCH_NAME
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application:** ${{ env.APP_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review and merge the PR in [gitops-apps](https://github.com/${{ env.GITOPS_REPO }}/pulls)" >> $GITHUB_STEP_SUMMARY
+          echo "2. ArgoCD will automatically deploy the new image" >> $GITHUB_STEP_SUMMARY
+          echo "3. Monitor the deployment in ArgoCD dashboard" >> $GITHUB_STEP_SUMMARY
+
+
