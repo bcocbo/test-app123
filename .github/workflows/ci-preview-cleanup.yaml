@@ -1,0 +1,78 @@
+name: CI Preview - Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: tes-app-123
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check if PR had preview label
+        id: check
+        run: |
+          HAS_LABEL=$(echo '${{ toJSON(github.event.pull_request.labels.*.name) }}' | jq 'any(. == "preview")')
+          echo "has_label=${HAS_LABEL}" >> $GITHUB_OUTPUT
+
+      # ArgoCD se encarga de la limpieza de K8s:
+      #   - El PR Generator deja de emitir el PR cerrado
+      #   - El ApplicationSet elimina la Application
+      #   - Con prune: true, se eliminan los recursos y el namespace
+      #
+      # Este job solo limpia las imágenes de ECR.
+
+      - name: Configure AWS credentials
+        if: steps.check.outputs.has_label == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup ECR preview images
+        if: steps.check.outputs.has_label == 'true'
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          echo "Limpiando imágenes de preview para PR #${PR_NUMBER}..."
+
+          IMAGE_IDS=$(aws ecr list-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "imageIds[?starts_with(imageTag, 'pr-${PR_NUMBER}-')]" \
+            --output json)
+
+          if [ "$IMAGE_IDS" != "[]" ] && [ -n "$IMAGE_IDS" ]; then
+            echo "Eliminando imágenes: ${IMAGE_IDS}"
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --region ${{ env.AWS_REGION }} \
+              --image-ids "$IMAGE_IDS" || echo "No se pudieron eliminar algunas imágenes"
+          else
+            echo "No se encontraron imágenes de preview para PR #${PR_NUMBER}"
+          fi
+
+      - name: Comment cleanup on PR
+        if: steps.check.outputs.has_label == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## 🧹 Preview Cleanup
+
+              - ✅ ArgoCD Application eliminada (automático)
+              - ✅ Namespace eliminado (prune automático)
+              - ✅ Imágenes ECR limpiadas`
+            });
