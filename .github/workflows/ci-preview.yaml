@@ -1,0 +1,153 @@
+name: CI Preview - Ephemeral Environments
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: tes-app-123
+
+jobs:
+  check-label:
+    runs-on: ubuntu-latest
+    outputs:
+      has_preview_label: ${{ steps.check.outputs.has_label }}
+    steps:
+      - name: Check for preview label
+        id: check
+        run: |
+          HAS_LABEL=$(echo '${{ toJSON(github.event.pull_request.labels.*.name) }}' | jq 'any(. == "preview")')
+          echo "has_label=${HAS_LABEL}" >> $GITHUB_OUTPUT
+          echo "Preview label present: ${HAS_LABEL}"
+
+  build-preview:
+    needs: check-label
+    if: needs.check-label.outputs.has_preview_label == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate preview image tag
+        id: image-tag
+        run: |
+          # IMPORTANTE: El tag sigue el patrón pr-{number}-{short_sha}
+          # para que coincida con el parameter del ApplicationSet en ArgoCD:
+          # microservice.image: 'ECR_REGISTRY/tes-app-123:pr-{{number}}-{{head_short_sha}}'
+          SHORT_SHA=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-7)
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          IMAGE_TAG="pr-${PR_NUMBER}-${SHORT_SHA}"
+          FULL_IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image-tag.outputs.full_image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.pull_request.updated_at }}
+            VCS_REF=${{ github.event.pull_request.head.sha }}
+
+      - name: Comment on PR with preview info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const branchSlug = context.payload.pull_request.head.ref
+              .toLowerCase()
+              .replace(/[^a-z0-9-]/g, '-')
+              .replace(/-+/g, '-')
+              .substring(0, 48);
+            const namespace = `preview-${branchSlug}-${prNumber}`;
+            const image = '${{ steps.image-tag.outputs.full_image }}';
+
+            const body = `## 🚀 Preview Environment
+
+            | Detalle | Valor |
+            |---------|-------|
+            | **Namespace** | \`${namespace}\` |
+            | **Image** | \`${image}\` |
+            | **ArgoCD App** | \`preview-${branchSlug}-${prNumber}\` |
+
+            ### Verificar el despliegue
+            \`\`\`bash
+            kubectl get pods -n ${namespace}
+            kubectl get svc -n ${namespace}
+            \`\`\`
+
+            > El ambiente se destruirá automáticamente cuando se cierre o mergee este PR.`;
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.data.find(c =>
+              c.body.includes('## 🚀 Preview Environment') && c.user.type === 'Bot'
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body,
+              });
+            }
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Preview Build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.image-tag.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD ApplicationSet detectará el PR con label \`preview\` y creará el ambiente efímero." >> $GITHUB_STEP_SUMMARY
+          echo "**No se modifica el repo de gitops** — la imagen se resuelve por convención de tag." >> $GITHUB_STEP_SUMMARY
