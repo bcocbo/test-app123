@@ -10,7 +10,7 @@ on:
       - 'README.md'
       - 'docs/**'
       - '.gitignore'
-      - '.github/workflows/ci.yaml'  # Ignorar cambios al workflow mismo
+      - '.github/workflows/**'  # Ignorar cambios al workflow mismo
 
 env:
   AWS_REGION: us-east-1
