@@ -16,7 +16,7 @@ Este repositorio incluye un workflow de GitHub Actions que automáticamente:
 
 Debes configurar los siguientes secretos en GitHub:
 
-### 1. AWS_ROLE_ARN
+### 1. AWS_ROLE_ARN-p
 
 ARN del rol de IAM que GitHub Actions usará para acceder a AWS.
 
