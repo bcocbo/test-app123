@@ -10,7 +10,7 @@ try:
     response = conn.getresponse()
     
     if response.status == 200:
-        print(f'✅ Health check passed: {response.status}')
+        print(f'✅ Health check passed preview: {response.status}')
         sys.exit(0)
     else:
         print(f'❌ Health check failed: {response.status}')
